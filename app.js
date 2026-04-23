@@ -1,9 +1,14 @@
 const express = require('express');
-const axios = require('axios');
+const cron = require('node-cron');
 const db = require('./db');
 const TransactionModel = require('./models/transaction');
-const WalletModel = require('./models/wallet');
-
+const { initiateCreditPayment } = require('./services/payment/initiateCredit');
+const { createPaymentProvider } = require('./services/payment/factory');
+const {
+  fulfillSuccessfulCredit,
+  markTransactionFailed,
+} = require('./services/payment/creditFulfillment');
+const { runReconcileOnce } = require('./jobs/reconcilePending');
 
 const port = process.env.PORT || 3000;
 
@@ -13,111 +18,135 @@ app.use(express.json());
 
 db.connect();
 
+// Production often runs reconciliation in a separate worker; in-process cron is for teaching demos.
+cron.schedule('*/5 * * * *', () => {
+  runReconcileOnce().catch((err) => console.error('reconcile cron', err));
+});
+
 app.get('/', (req, res) => {
-    res.send('Welcome To Paystack Integration, I see you');
-})
+  const name = req.query.name || 'World';
+  res.send(`Welcome To Paystack Integration, I see you ${name}`);
+});
 
-// initialize transaction
 app.post('/initiate_transaction', async (req, res) => {
-    try {
-
-  
-
-    console.log(req.body);
+  try {
     if (!req.body.amountInNaira || !req.body.email) {
-        return res.status(400).json({
-            message: 'Invalid request',
-        });
-    }
-
-    // creating wallet if it doesn't exist
-    let wallet = await WalletModel.findOne({ email: req.body.email });
-
-    if (!wallet) {
-        wallet = await WalletModel.create({
-            balance: 0,
-            email: req.body.email,
-        });
-    }
-
-    const transaction = await TransactionModel.create({
-        amount: req.body.amountInNaira,
-        status: 'pending',
-        type: 'credit',
-        walletId: wallet._id,
-    });
-
-    const data = {
-        amount: req.body.amountInNaira * 100,
-        email: req.body.email,
-        reference: transaction._id,
-      };
-
-    const headers = {
-        Authorization: `Bearer ${process.env.PAYSTACK_SECRET_KEY}`,
-      };
-    
-      console.log(data);
-      const response = await axios.post('https://api.paystack.co/transaction/initialize', 
-      data, 
-      {
-        headers,
+      return res.status(400).json({
+        message: 'Invalid request, add amountInNaira and/or email',
       });
-    
-      return res.json(response.data);
-    } catch (error) {
-        console.log(error);
-        return res.status(500).json({
-            message: 'Something went wrong',
-        });
     }
-})
 
-// success url
-app.get('/paystack/success', async (req, res) => {
+    const amount = Number(req.body.amountInNaira);
+    if (Number.isNaN(amount) || amount <= 0) {
+      return res.status(400).json({ message: 'Invalid amountInNaira' });
+    }
+
+    const { paystackResponse } = await initiateCreditPayment({
+      amount,
+      email: req.body.email,
+    });
+
+    return res.json(paystackResponse);
+  } catch (error) {
+    return res.status(500).json({
+      message: 'Something went wrong',
+    });
+  }
+});
+
+app.get('/generate_url', async (req, res) => {
+  if (!req.query.amount || !req.query.email) {
+    return res.status(400).json({
+      message: 'Invalid request, add amount and/or email',
+    });
+  }
+
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(req.query.email)) {
+    return res.status(400).json({
+      message: 'Invalid email',
+    });
+  }
+
+  const amount = Number(req.query.amount);
+  if (Number.isNaN(amount) || amount <= 0) {
+    return res.status(400).json({ message: 'Invalid amount' });
+  }
+
+  try {
+    const { init } = await initiateCreditPayment({
+      amount,
+      email: req.query.email,
+    });
     return res.json({
-        message: 'Transaction successful',
+      url: init.authorizationUrl,
     });
-})
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ message: 'Something went wrong' });
+  }
+});
 
-// callback url
+app.get('/paystack/info', async (req, res) => {
+  return res.json({
+    message: 'Transaction successful',
+  });
+});
+
+app.post('/stripe/callback', async (req, res) => {
+  const provider = createPaymentProvider('stripe');
+  return res.json({
+    message: 'Stripe callback received',
+  });
+});
+
+app.post('/paystack/success', async (req, res) => {
+  return res.json({
+    message: 'Successfully processed payment',
+  });
+});
+
 app.post('/paystack/callback', async (req, res) => {
-    const body = req.body;
-    const transaction = await TransactionModel.findOne({ _id: body.data.reference, status: 'pending' });
-    console.log(req.body)
+  const body = req.body;
+  const paystack = createPaymentProvider('paystack');
+  const normalized = paystack.normalizeWebhookPayload(body);
 
-    if (!transaction) {
-        console.log('Transaction not found');
-        return res.status(404).json({
-            message: 'Transaction not found',
-        });
-    }
+  if (!normalized.reference) {
+    return res.status(400).json({ message: 'Invalid webhook payload' });
+  }
 
-    console.log('Transaction found', body.data.reference)
+  // ensure the transaction is pending
+  const transaction = await TransactionModel.findOne({
+    _id: normalized.reference,
+    status: 'pending',
+  });
 
-    // success
-    if (body.event === 'charge.success') {
-        
-
-        const wallet = await WalletModel.findOne({ _id: transaction.walletId });
-        wallet.balance = wallet.balance + transaction.amount;
-        wallet.save();
-
-        transaction.status = 'success';
-        transaction.save();
-    }
-
-    // failed
-    if (body.event === 'charge.failed') {
-        transaction.status = 'failed';
-        transaction.save();
-    }
-
-    return res.status(200).json({
-        message: 'Callback received',
+  if (!transaction) {
+    console.log('Transaction not found');
+    return res.status(404).json({
+      message: 'Transaction not found',
     });
-})
+  }
+
+  console.log('Transaction found', normalized.reference);
+
+  // routing
+  if (normalized.succeeded) {
+    const result = await fulfillSuccessfulCredit(normalized.reference);
+    if (!result.applied) {
+      console.log('Duplicate or late success webhook; already finalized');
+    }
+  }
+
+  if (normalized.failed) {
+    await markTransactionFailed(normalized.reference);
+  }
+
+  return res.status(200).json({
+    message: 'Callback received',
+  });
+});
 
 app.listen(port, () => {
-    console.log(`Server is running on port ${port}`);
-})
+  console.log(`Server is running on port ${port}`);
+});

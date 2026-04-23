@@ -13,6 +13,9 @@ const TransactionSchema = new Schema({
   type: { type: String, required: true, enum: ['credit', 'debit'] },
   walletId: { type: String, required: true, ref: 'wallets' },
   status: { type: String, required: true, enum: ['pending', 'success', 'failed'], default: 'pending' },
+  provider: { type: String, default: 'paystack' },
+  lastReconciledAt: { type: Date },
+  reconcileAttempts: { type: Number, default: 0 },
 });
 
 const TransactionModel = mongoose.model('transaction', TransactionSchema);
