@@ -25,6 +25,7 @@ cron.schedule('*/5 * * * *', () => {
 
 app.get('/', (req, res) => {
   const name = req.query.name || 'World';
+  console.log({ name });
   res.send(`Welcome To Paystack Integration, I see you ${name}`);
 });
 
@@ -100,7 +101,7 @@ app.post('/stripe/callback', async (req, res) => {
   });
 });
 
-app.post('/paystack/success', async (req, res) => {
+app.get('/paystack/success', async (req, res) => {
   return res.json({
     message: 'Successfully processed payment',
   });
